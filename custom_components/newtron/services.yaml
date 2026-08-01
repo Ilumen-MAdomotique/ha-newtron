@@ -1,0 +1,35 @@
+send_command:
+  name: Send command
+  description: >-
+    Send any documented Newtron MQTT command to a device
+    (cmnd/<topic>/<command>) and optionally return the JSON response.
+  fields:
+    device_id:
+      name: Device
+      description: The Newtron device to target.
+      required: true
+      selector:
+        device:
+          integration: newtron
+    command:
+      name: Command
+      description: "Command name, e.g. Power1, StatusAll, SetRollerConfig."
+      required: true
+      example: "Power1"
+      selector:
+        text:
+    payload:
+      name: Payload
+      description: "Optional payload, e.g. TOGGLE or a JSON array/object."
+      required: false
+      example: "TOGGLE"
+      selector:
+        text:
+          multiline: true
+    wait:
+      name: Wait for response
+      description: Wait for the device's stat response (needed for response data).
+      required: false
+      default: true
+      selector:
+        boolean:

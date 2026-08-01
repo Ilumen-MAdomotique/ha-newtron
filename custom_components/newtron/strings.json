@@ -1,0 +1,45 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Add a Newtron device",
+        "description": "{info}",
+        "menu_options": {
+          "discover": "Search the MQTT broker for devices",
+          "manual": "Enter the device topic manually"
+        }
+      },
+      "discover": {
+        "title": "Discovered Newtron devices",
+        "description": "Select the device to add. Only devices that answered on the broker are listed.",
+        "data": {
+          "topic": "Device"
+        }
+      },
+      "manual": {
+        "title": "Newtron device topic",
+        "description": "Enter the MQTT topic of the device — the value of its Topic setting, e.g. SMART8R-1501. Use this when the device is connected to the broker but did not answer the search.",
+        "data": {
+          "topic": "MQTT topic"
+        }
+      }
+    },
+    "error": {
+      "no_response": "The device did not answer the Discover command on this topic. Check the topic and that the device is connected to this broker."
+    },
+    "abort": {
+      "mqtt_unavailable": "The MQTT integration is not set up. Configure it first.",
+      "already_configured": "This device is already configured."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Newtron options",
+        "data": {
+          "scan_interval": "Polling interval (seconds, StatusAll)"
+        }
+      }
+    }
+  }
+}
