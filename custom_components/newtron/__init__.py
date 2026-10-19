@@ -8,10 +8,11 @@ import voluptuous as vol
 
 from homeassistant.components import mqtt
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant, ServiceCall, callback
+from homeassistant.core import HomeAssistant, ServiceCall, SupportsResponse, callback
 from homeassistant.exceptions import ConfigEntryNotReady, HomeAssistantError
 from homeassistant.helpers import config_validation as cv, device_registry as dr
 from homeassistant.helpers.event import async_track_time_interval
+from homeassistant.helpers.service import async_register_admin_service
 from homeassistant.helpers.typing import ConfigType
 
 from .const import (
@@ -56,12 +57,13 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
             return result or {}
         return None
 
-    hass.services.async_register(
+    async_register_admin_service(
+        hass,
         DOMAIN,
         SERVICE_SEND_COMMAND,
         _handle_send_command,
         schema=SERVICE_SEND_COMMAND_SCHEMA,
-        supports_response="optional",
+        supports_response=SupportsResponse.OPTIONAL,
     )
     return True
 

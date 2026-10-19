@@ -15,6 +15,7 @@ def async_register_websocket_api(hass: HomeAssistant) -> None:
     websocket_api.async_register_command(hass, ws_command)
 
 
+@websocket_api.require_admin
 @websocket_api.websocket_command({vol.Required("type"): WS_DEVICES})
 @websocket_api.async_response
 async def ws_devices(
