@@ -1,11 +1,14 @@
 """Config flow for Newtron Smart.
 
-Two paths:
+Three paths:
 - Auto discovery: publish ``Discover`` on the Tasmota group topic and
   listen on ``stat/+/RESULT`` for the (unauthenticated, doc §14) reply
   carrying the serial number and MAC.
-- Manual: the user types the device MQTT topic; the flow validates it by
-  sending ``Discover`` directly to the device.
+- Manual: the user types the card serial number; the flow finds the card
+  on the broker by asking it (or every card seen there) for ``Discover``.
+- Broker watch (inventory.py): a card that comes online starts a flow on
+  its own. Cards listed in the inventory are added without asking; others
+  wait for a one-click confirmation under "Discovered".
 """
 from __future__ import annotations
 
@@ -31,39 +34,18 @@ from .const import (
     CONF_SERIAL,
     CONF_TOPIC,
     CONF_TOPIC_SCHEME,
+    DATA_INVENTORY,
     DEFAULT_SCAN_INTERVAL,
     DEFAULT_TOPIC_SCHEME,
     DOMAIN,
 )
+from .inventory import identity_from_payload
 
 _LOGGER = logging.getLogger(__name__)
 
 DISCOVERY_WINDOW = 5.0  # seconds listening for Discover replies
 RETAINED_WINDOW = 2.5  # seconds collecting retained broker announcements
-
-
-def _identity_from_payload(payload: Any, fallback_topic: str) -> dict[str, str] | None:
-    """Parse a Discover reply.
-
-    Firmware 2.x answers flat ({"serial_number": ..., "board_name": ...});
-    older firmware wraps the same fields in a "Discover" object.
-    """
-    try:
-        data = json.loads(payload)
-    except (ValueError, TypeError):
-        return None
-    if not isinstance(data, dict):
-        return None
-    identity = data.get("Discover")
-    if not isinstance(identity, dict):
-        if "serial_number" not in data:
-            return None
-        identity = data
-    return {
-        "serial": identity.get("serial_number", fallback_topic),
-        "mac": identity.get("mac_address", ""),
-        "board": identity.get("board_name", ""),
-    }
+GROUP_TOPIC = "newtrons"  # every card answers d/newtrons/cmnd/<Cmd> (checked on fw 2.6.0)
 
 
 class NewtronConfigFlow(ConfigFlow, domain=DOMAIN):
@@ -73,6 +55,59 @@ class NewtronConfigFlow(ConfigFlow, domain=DOMAIN):
 
     def __init__(self) -> None:
         self._discovered: dict[str, dict[str, str]] = {}
+        self._discovery_info: dict[str, Any] = {}
+
+    async def async_step_integration_discovery(
+        self, discovery_info: dict[str, Any]
+    ) -> ConfigFlowResult:
+        """A card came online on the broker (see inventory.py)."""
+        serial = discovery_info["serial"]
+        # A card listed in the inventory goes through even if it is already
+        # waiting under "Discovered"; creating the entry closes that offer.
+        await self.async_set_unique_id(
+            serial, raise_on_progress=not discovery_info.get("inventory_name")
+        )
+        # A known card that moved to another topic just follows it.
+        self._abort_if_unique_id_configured(
+            updates={CONF_TOPIC: discovery_info[CONF_TOPIC]}
+        )
+        self._discovery_info = discovery_info
+        board = discovery_info.get("board") or ""
+        self.context["title_placeholders"] = {
+            "name": f"{serial} — {board}" if board else serial
+        }
+        if discovery_info.get("inventory_name"):
+            return self._async_create_discovered()
+        return await self.async_step_confirm()
+
+    async def async_step_confirm(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        if user_input is not None:
+            return self._async_create_discovered()
+        self._set_confirm_only()
+        info = self._discovery_info
+        return self.async_show_form(
+            step_id="confirm",
+            description_placeholders={
+                "serial": info["serial"],
+                "board": info.get("board") or "?",
+                "topic": info[CONF_TOPIC],
+            },
+        )
+
+    @callback
+    def _async_create_discovered(self) -> ConfigFlowResult:
+        info = self._discovery_info
+        return self.async_create_entry(
+            title=info.get("inventory_name") or info["serial"],
+            data={
+                CONF_TOPIC: info[CONF_TOPIC],
+                CONF_SERIAL: info["serial"],
+                CONF_MAC: info.get("mac", ""),
+                CONF_TOPIC_SCHEME: DEFAULT_TOPIC_SCHEME,
+            },
+        )
 
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
@@ -206,7 +241,7 @@ class NewtronConfigFlow(ConfigFlow, domain=DOMAIN):
             if len(parts) != 4:
                 return
             topic = parts[1]
-            identity = _identity_from_payload(msg.payload, topic)
+            identity = identity_from_payload(msg.payload, topic)
             if identity is None:
                 return
             if not identity.get("board"):
@@ -228,37 +263,58 @@ class NewtronConfigFlow(ConfigFlow, domain=DOMAIN):
         # layout (d/<topic>/cmnd|stat|tele/...) regardless of whether the
         # broker is the vendor's cloud one or a local broker such as this
         # Home Assistant instance, so the scheme is no longer asked here.
+        # The card is identified by its serial number only: its topic is
+        # whatever it answers on, the installer never has to know it.
         errors: dict[str, str] = {}
         if user_input is not None:
-            topic = user_input[CONF_TOPIC].strip().strip("/")
-            identity = await self._async_probe(topic)
-            if identity is None:
+            found = await self._async_find_serial(user_input[CONF_SERIAL].strip())
+            if found is None:
                 errors["base"] = "no_response"
             else:
+                topic, identity = found
                 return await self._async_create(
                     topic, identity["serial"], identity["mac"], DEFAULT_TOPIC_SCHEME
                 )
 
         return self.async_show_form(
             step_id="manual",
-            data_schema=vol.Schema({vol.Required(CONF_TOPIC): str}),
+            data_schema=vol.Schema({vol.Required(CONF_SERIAL): str}),
             errors=errors,
         )
 
-    async def _async_probe(self, topic: str) -> dict[str, str] | None:
-        """Send Discover directly to <topic> and wait for the reply."""
-        fut: asyncio.Future = self.hass.loop.create_future()
+    async def _async_find_serial(
+        self, serial: str
+    ) -> tuple[str, dict[str, str]] | None:
+        """Find the topic of the card that answers with this serial number.
+
+        Topics are often unrelated to the serial (``newtron_B032A0`` for
+        SMART16R-1523), so every card is asked at once through the group
+        topic, plus each topic the broker watch knows in case a card's group
+        topic was changed. The first reply carrying the serial wins.
+        """
+        wanted = serial.casefold()
+        found: asyncio.Future = self.hass.loop.create_future()
 
         @callback
-        def _on_msg(msg: mqtt.ReceiveMessage) -> None:
-            identity = _identity_from_payload(msg.payload, topic)
-            if identity is not None and not fut.done():
-                fut.set_result(identity)
+        def _on_result(msg: mqtt.ReceiveMessage) -> None:
+            parts = msg.topic.split("/")
+            if len(parts) != 4:
+                return
+            identity = identity_from_payload(msg.payload, parts[1])
+            if (
+                identity is not None
+                and identity["serial"].casefold() == wanted
+                and not found.done()
+            ):
+                found.set_result((parts[1], identity))
 
-        unsub = await mqtt.async_subscribe(self.hass, f"d/{topic}/stat/#", _on_msg)
+        inventory = self.hass.data.get(DATA_INVENTORY)
+        topics = [GROUP_TOPIC, serial, *(inventory.broker if inventory else ())]
+        unsub = await mqtt.async_subscribe(self.hass, "d/+/stat/RESULT", _on_result)
         try:
-            await mqtt.async_publish(self.hass, f"d/{topic}/cmnd/Discover", "")
-            return await asyncio.wait_for(fut, 5.0)
+            for topic in dict.fromkeys(topics):
+                await mqtt.async_publish(self.hass, f"d/{topic}/cmnd/Discover", "")
+            return await asyncio.wait_for(found, DISCOVERY_WINDOW)
         except asyncio.TimeoutError:
             return None
         finally:

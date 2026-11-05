@@ -22,6 +22,13 @@ async def async_register_panel(hass: HomeAssistant) -> None:
     hass.data[_REGISTERED_KEY] = True
 
     frontend_dir = Path(__file__).parent / "frontend"
+    # Versioned URL: browsers keep the panel module cached, so a new file
+    # must come with a new URL to be loaded after an update.
+    version = int(
+        await hass.async_add_executor_job(
+            lambda: (frontend_dir / "newtron-panel.js").stat().st_mtime
+        )
+    )
     await hass.http.async_register_static_paths(
         [
             StaticPathConfig(
@@ -33,7 +40,7 @@ async def async_register_panel(hass: HomeAssistant) -> None:
         hass,
         webcomponent_name="newtron-panel",
         frontend_url_path=PANEL_URL_PATH,
-        module_url=f"{PANEL_STATIC_PATH}/newtron-panel.js",
+        module_url=f"{PANEL_STATIC_PATH}/newtron-panel.js?v={version}",
         sidebar_title=PANEL_TITLE,
         sidebar_icon=PANEL_ICON,
         require_admin=True,

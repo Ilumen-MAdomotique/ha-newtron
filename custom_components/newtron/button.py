@@ -1,4 +1,4 @@
-"""Button platform: identify blink and dimmer reset."""
+"""Button platform: identify blink, dimmer reset and DALI detection."""
 from __future__ import annotations
 
 from homeassistant.components.button import ButtonDeviceClass, ButtonEntity
@@ -7,7 +7,7 @@ from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import DOMAIN, FAMILY_DIMMER
+from .const import DOMAIN, FAMILY_DALI, FAMILY_DIMMER
 from .entity import NewtronEntity
 from .hub import NewtronHub
 
@@ -19,6 +19,8 @@ async def async_setup_entry(
     entities: list[ButtonEntity] = [NewtronIdentifyButton(hub)]
     if hub.family == FAMILY_DIMMER:
         entities.append(NewtronAOResetButton(hub))
+    if hub.family == FAMILY_DALI:
+        entities.append(NewtronDaliDetectButton(hub))
     async_add_entities(entities)
 
 
@@ -50,3 +52,18 @@ class NewtronAOResetButton(NewtronEntity, ButtonEntity):
 
     async def async_press(self) -> None:
         await self._hub.async_command("AOReset")
+
+
+class NewtronDaliDetectButton(NewtronEntity, ButtonEntity):
+    """DaliDetect: sweeps the 64 addresses (~6.5 s); new lights then appear (doc §21.6)."""
+
+    _attr_entity_category = EntityCategory.CONFIG
+    _attr_name = "Détecter les lumières DALI"
+    _attr_icon = "mdi:magnify-scan"
+
+    def __init__(self, hub: NewtronHub) -> None:
+        super().__init__(hub)
+        self._attr_unique_id = f"{hub.serial_number}_dali_detect"
+
+    async def async_press(self) -> None:
+        await self._hub.async_command("DaliDetect")

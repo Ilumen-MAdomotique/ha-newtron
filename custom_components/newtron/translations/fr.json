@@ -1,0 +1,51 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Ajouter une carte Newtron",
+        "description": "{info}",
+        "menu_options": {
+          "discover": "Rechercher les cartes sur le broker MQTT",
+          "manual": "Saisir le numéro de série de la carte"
+        }
+      },
+      "discover": {
+        "title": "Cartes Newtron trouvées",
+        "description": "Choisissez la carte à ajouter. Les cartes qui répondent apparaissent en premier.",
+        "data": {
+          "topic": "Carte"
+        }
+      },
+      "manual": {
+        "title": "Numéro de série de la carte Newtron",
+        "description": "Saisissez le numéro de série de la carte, tel qu'il est sur son étiquette, par exemple SMART16R-1504. Home Assistant retrouve tout seul la carte sur le broker MQTT.",
+        "data": {
+          "serial_number": "N° de série"
+        }
+      },
+      "confirm": {
+        "title": "Carte Newtron trouvée",
+        "description": "La carte {serial} ({board}) est en ligne sur le broker (topic {topic}). L'ajouter à Home Assistant ?"
+      }
+    },
+    "error": {
+      "no_response": "Aucune carte connectée à ce broker n'a répondu avec ce numéro de série. Vérifiez le numéro et que la carte est bien connectée à ce broker."
+    },
+    "abort": {
+      "mqtt_unavailable": "L'intégration MQTT n'est pas configurée. Configurez-la d'abord.",
+      "already_configured": "Cette carte est déjà configurée.",
+      "already_in_progress": "Cette carte est déjà en cours d'ajout."
+    },
+    "flow_title": "{name}"
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Options Newtron",
+        "data": {
+          "scan_interval": "Intervalle de relecture (secondes, StatusAll)"
+        }
+      }
+    }
+  }
+}

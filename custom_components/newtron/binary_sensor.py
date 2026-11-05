@@ -8,7 +8,6 @@ from __future__ import annotations
 
 from homeassistant.components.binary_sensor import BinarySensorEntity
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
@@ -37,7 +36,13 @@ async def async_setup_entry(
 
 
 class NewtronInput(NewtronEntity, BinarySensorEntity):
-    """A physical input / digital button."""
+    """A physical input / digital button.
+
+    Disabled by default: inputs drive outputs on the board itself and
+    rarely need to show in Home Assistant.
+    """
+
+    _attr_entity_registry_enabled_default = False
 
     def __init__(self, hub: NewtronHub, idx: int) -> None:
         super().__init__(hub)
@@ -51,9 +56,12 @@ class NewtronInput(NewtronEntity, BinarySensorEntity):
 
 
 class NewtronVar(NewtronEntity, BinarySensorEntity):
-    """Volatile (Var) or persistent (Mem) variable state."""
+    """Volatile (Var) or persistent (Mem) variable state.
 
-    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    Off by default; once ticked in the Configuration tab it goes to its
+    area like any other entity (hence no diagnostic category).
+    """
+
     _attr_entity_registry_enabled_default = False
 
     def __init__(self, hub: NewtronHub, idx: int, persistent: bool) -> None:

@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 from homeassistant.core import callback
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.device_registry import DeviceInfo, format_mac
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.entity import Entity
 
+from .areas import async_auto_assign_area
 from .const import DOMAIN, MANUFACTURER, SIGNAL_UPDATE
 from .hub import NewtronHub
 
@@ -48,3 +50,45 @@ class NewtronEntity(Entity):
     @property
     def available(self) -> bool:
         return self._hub.available
+
+
+class NewtronBoardNamedEntity(NewtronEntity):
+    """Entity named on the board (output, shutter).
+
+    The name follows the board: renaming an output on the board renames it
+    here and moves it to the area its new name points to.
+
+    Since HA 2026.10 the device name ("SMART16R-1523") goes before the name
+    of an entity unless the entity has a name of its own: the board name is
+    given as that name, unless the entity was renamed in Home Assistant.
+    """
+
+    def _board_name(self) -> str:
+        raise NotImplementedError
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        self._async_show_board_name(None)
+        async_auto_assign_area(self.hass, self.entity_id, self._attr_name)
+
+    @callback
+    def _async_show_board_name(self, previous: str | None) -> None:
+        """Name the entity after the board, unless renamed in Home Assistant."""
+        ent_reg = er.async_get(self.hass)
+        entry = ent_reg.async_get(self.entity_id)
+        if entry is None or entry.name == self._attr_name:
+            return
+        if entry.name is None or entry.name == previous:
+            ent_reg.async_update_entity(self.entity_id, name=self._attr_name)
+
+    @callback
+    def _handle_update(self) -> None:
+        name = self._board_name()
+        if name != self._attr_name:
+            previous, self._attr_name = self._attr_name, name
+            er.async_get(self.hass).async_update_entity(
+                self.entity_id, original_name=name
+            )
+            self._async_show_board_name(previous)
+            async_auto_assign_area(self.hass, self.entity_id, name)
+        super()._handle_update()

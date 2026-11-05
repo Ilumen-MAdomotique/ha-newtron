@@ -6,7 +6,7 @@
         "description": "{info}",
         "menu_options": {
           "discover": "Search the MQTT broker for devices",
-          "manual": "Enter the device topic manually"
+          "manual": "Enter the card serial number"
         }
       },
       "discover": {
@@ -17,20 +17,26 @@
         }
       },
       "manual": {
-        "title": "Newtron device topic",
-        "description": "Enter the MQTT topic of the device — the value of its Topic setting, e.g. SMART8R-1501. Use this when the device is connected to the broker but did not answer the search.",
+        "title": "Newtron card serial number",
+        "description": "Enter the serial number of the card, as shown on its label, e.g. SMART16R-1504. Home Assistant finds the card on the MQTT broker by itself.",
         "data": {
-          "topic": "MQTT topic"
+          "serial_number": "Serial number"
         }
+      },
+      "confirm": {
+        "title": "Newtron card found",
+        "description": "Card {serial} ({board}) is online on the broker under topic {topic}. Add it to Home Assistant?"
       }
     },
     "error": {
-      "no_response": "The device did not answer the Discover command on this topic. Check the topic and that the device is connected to this broker."
+      "no_response": "No card connected to this broker answered with this serial number. Check the number and that the card is connected to this broker."
     },
     "abort": {
       "mqtt_unavailable": "The MQTT integration is not set up. Configure it first.",
-      "already_configured": "This device is already configured."
-    }
+      "already_configured": "This device is already configured.",
+      "already_in_progress": "This card is already being added."
+    },
+    "flow_title": "{name}"
   },
   "options": {
     "step": {

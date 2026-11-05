@@ -21,6 +21,20 @@ const INPUT_MODES_SMALL = [ // SMART 1R / 2R
 const OUTPUT_MODES = [
   { v: 0, l: "None" }, { v: 1, l: "Auto off" }, { v: 2, l: "Auto on" },
 ];
+// What is wired on an input, shown that way in Home Assistant ("" = plain contact)
+const SENSOR_TYPES = [
+  ["", "Contact"], ["door", "Porte"], ["window", "Fenêtre"], ["garage_door", "Porte de garage"],
+  ["motion", "Mouvement"], ["occupancy", "Présence"], ["smoke", "Fumée"], ["moisture", "Fuite d'eau"],
+  ["gas", "Gaz"], ["vibration", "Vibration"], ["tamper", "Sabotage"], ["power", "Courant"],
+];
+// Firmware the Maintenance tab accepts to install (anything else would wipe the Newtron firmware)
+const NEWTRON_FIRMWARE = /^https?:\/\/([a-z0-9-]+\.)*newtron\.tech\/.+\.bin$/i;
+// Probes the Configuration tab offers for a GPIO (firmware component codes)
+const GPIO_PROBES = [
+  [0, "Rien de branché"], [1312, "Sonde de température DS18B20"],
+  [1216, "Température + humidité DHT22 / AM2301"], [1184, "Température + humidité DHT11"],
+  [1248, "Température + humidité SI7021"],
+];
 const SHUTTER_MODES = [
   { v: "0", l: "Double toggle" }, { v: "1", l: "Double push" }, { v: "2", l: "Simple push" },
 ];
@@ -80,8 +94,16 @@ class NewtronPanel extends HTMLElement {
   }
 
   async _tick() {
-    if (this._editing) return;
+    if (this._editing || this._busy()) return;
     await this._loadDevices(true);
+  }
+
+  // The refresh redraws the tab, which closes an open list and drops the
+  // cursor from a field: wait while a field has focus or a card form is open.
+  _busy() {
+    const active = this.shadowRoot.activeElement;
+    if (active && active.matches("input, select, textarea")) return true;
+    return this._tab === "config" && !!this._cfgDraft;
   }
 
   // -- websocket -------------------------------------------------------
@@ -91,11 +113,12 @@ class NewtronPanel extends HTMLElement {
     try {
       const res = await this._ws({ type: "newtron/devices" });
       this._devices = res.devices || [];
-      if (!this._selected && this._devices.length) {
+      if (!this.dev && this._devices.length) {
         this._selected = this._devices[0].entry_id;
       }
+      if (!this.dev) this._tab = "config";
       this._renderNav();
-      if (!quiet || this._tab === "overview") this._renderTab();
+      if (!quiet || this._tab === "overview" || this._tab === "config") this._renderTab();
     } catch (e) {
       if (!quiet) this._toast(`Could not load devices: ${e.message || e}`, true);
     }
@@ -152,7 +175,14 @@ class NewtronPanel extends HTMLElement {
     if (dev.family === "ir") {
       return [
         ["overview", "Overview"], ["ir", "IR remotes"], ["timers", "Timers"],
-        ["webhooks", "Webhooks"], ["network", "Network"], ["console", "Console"],
+        ["webhooks", "Webhooks"], ["network", "Network"], ["maintenance", "Maintenance"], ["console", "Console"],
+      ];
+    }
+    if (dev.family === "dali") {
+      // Lights, groups and scenes live on the DALI bus: no relay, input or shutter
+      return [
+        ["overview", "Overview"], ["timers", "Timers"], ["webhooks", "Webhooks"],
+        ["network", "Network"], ["maintenance", "Maintenance"], ["console", "Console"], ["config", "Configuration"],
       ];
     }
     const t = [["overview", "Overview"], ["inputs", "Inputs"]];
@@ -162,7 +192,7 @@ class NewtronPanel extends HTMLElement {
     t.push(["timers", "Timers"], ["webhooks", "Webhooks"]);
     if (dev.capabilities && dev.capabilities.max_vthermostats) t.push(["thermostats", "Thermostats"]);
     if (dev.family === "pro") t.push(["datalogger", "Data logger"]);
-    t.push(["network", "Network"], ["console", "Console"]);
+    t.push(["network", "Network"], ["maintenance", "Maintenance"], ["console", "Console"], ["config", "Configuration"]);
     return t;
   }
 
@@ -179,21 +209,22 @@ class NewtronPanel extends HTMLElement {
     } else {
       conn.textContent = "";
     }
+    sel.hidden = !this._devices.length;
     const tabs = this.shadowRoot.getElementById("tabs");
-    tabs.innerHTML = dev
-      ? this._tabsFor(dev).map(([id, label]) =>
-          `<button data-tab="${id}" class="${id === this._tab ? "active" : ""}">${label}</button>`).join("")
-      : "";
+    tabs.innerHTML = (dev ? this._tabsFor(dev) : [["config", "Configuration"]])
+      .map(([id, label]) =>
+        `<button data-tab="${id}" class="${id === this._tab ? "active" : ""}">${label}</button>`).join("");
   }
 
   async _renderTab() {
     const c = this.shadowRoot.getElementById("content");
-    const dev = this.dev;
-    if (!dev) {
-      c.innerHTML = `<div class="empty">No Newtron device configured yet.<br>
-        Add one in <b>Settings &rarr; Devices &amp; services &rarr; Add integration &rarr; Newtron Smart</b>.</div>`;
+    if (this._tab === "config") {
+      try { await this._tabConfig(c); } catch (e) { c.innerHTML = `<div class="empty">⚠ ${esc(e.message || e)}</div>`; }
+      this._editing = false;
       return;
     }
+    const dev = this.dev;
+    if (!dev) return;
     c.innerHTML = `<div class="loading">Loading…</div>`;
     try {
       switch (this._tab) {
@@ -209,6 +240,7 @@ class NewtronPanel extends HTMLElement {
         case "thermostats": await this._tabThermostats(c, dev); break;
         case "datalogger": await this._tabDataLogger(c, dev); break;
         case "network": await this._tabNetwork(c, dev); break;
+        case "maintenance": await this._tabMaintenance(c, dev); break;
         case "console": this._tabConsole(c); break;
       }
     } catch (e) {
@@ -239,6 +271,13 @@ class NewtronPanel extends HTMLElement {
         `<div class="io ao ${v > 0 ? "on" : ""}"><span>AO</span>${k.replace("ao", "")}<b>${v}%</b></div>`),
       ...Object.entries(sa.roller_shutters || {}).map(([k, v]) =>
         `<div class="io sh"><span>SH</span>${k.replace("roller_shutter", "")}<b>${v.Position}%</b></div>`),
+      ...Object.entries(sa.lights || {}).map(([k, v]) => {
+        const n = k.replace("light", "");
+        const ok = v.state === "OK";
+        return `<div class="io ao ${ok ? "dali-ctl" : ""} ${v.level > 0 ? "on" : ""}" data-dali="${n}"
+          title="${esc(v.name || `DALI ${n}`)} — ${esc(v.state || "")}${ok ? " (click to toggle)" : ""}">
+          <span>DALI</span>${n}<b>${ok ? `${v.level ?? "—"}%` : esc(v.state || "?")}</b></div>`;
+      }),
     ].join("");
 
     const sensorRows = Object.entries(sa.sensors || {})
@@ -246,11 +285,13 @@ class NewtronPanel extends HTMLElement {
       .map(([k, v]) => `<tr><td>${esc(k)}</td><td>${esc(v.id ?? "")}</td>
         <td>${v.temperature ?? "—"} °${esc(sa.sensors.temp_unit || "C")}</td></tr>`).join("");
 
+    const dali = dev.family === "dali";
     c.innerHTML = `
       <div class="card">
-        <h3>Inputs</h3>
-        <div class="strip">${inputCells || "<i>No live inputs yet — press Refresh.</i>"}</div>
-        <h3 style="margin-top:16px">Outputs <span class="hint-inline">— click an output to toggle it</span></h3>
+        ${dali ? "" : `<h3>Inputs</h3>
+        <div class="strip">${inputCells || "<i>No live inputs yet — press Refresh.</i>"}</div>`}
+        <h3 ${dali ? "" : `style="margin-top:16px"`}>${dali ? "Lumières DALI" : "Outputs"} <span class="hint-inline">— ${dali
+          ? "cliquez une lumière pour l'allumer / l'éteindre" : "click an output to toggle it"}</span></h3>
         <div class="strip">${outputCells || "<i>No live outputs yet — press Refresh.</i>"}</div>
       </div>
       <div class="grid">
@@ -299,6 +340,14 @@ class NewtronPanel extends HTMLElement {
       await this.cmd("VisualDiscover", "", false);
       this._toast("Identification blink started");
     };
+    c.querySelectorAll(".dali-ctl").forEach((el) => {
+      el.onclick = async () => {
+        await this.cmd(`DaliPower${el.dataset.dali}`, "2", false);
+        await this.cmd(`DaliState${el.dataset.dali}`).catch(() => {});
+        await this.cmd("StatusAll").catch(() => {});
+        await this._loadDevices();
+      };
+    });
     c.querySelectorAll(".out-ctl").forEach((el) => {
       el.onclick = async () => {
         const n = el.dataset.relay;
@@ -1299,6 +1348,493 @@ class NewtronPanel extends HTMLElement {
     };
   }
 
+  // -- MAINTENANCE -----------------------------------------------------
+  // Firmware update (OtaUrlDiscover + UpgradeDiscover), location for the sun
+  // and prayer timers (GeoCity / GeoCountry), 8R / 16R hardware revision
+  // (SmartHwRev).
+  async _tabMaintenance(c, dev) {
+    const info = (dev.device_status || {}).device_info || {};
+    const [ota, city, country] = await Promise.all([
+      this.cmd("OtaUrl", "", true, 4).catch(() => null),
+      this.cmd("GeoCity", "", true, 4).catch(() => null),
+      this.cmd("GeoCountry", "", true, 4).catch(() => null),
+    ]);
+    const url = (ota && (ota.OtaUrl || ota.OtaUrlDiscover)) || "";
+    const rev = info.hardware_revision;
+    const old16r = /^2\.2\./.test(info.firmware_version || "");
+    c.innerHTML = `
+      <div class="card"><h3>Firmware</h3>
+        ${kv("Version installée", info.firmware_version)}
+        <div class="form-grid" style="margin-top:12px">
+          <label>Adresse du firmware<input id="mt-url" value="${esc(url)}"
+            placeholder="https://newtron.tech/firmware/smart8r_last_fr.bin"></label>
+        </div>
+        ${url && !NEWTRON_FIRMWARE.test(url) ? `<p class="hint">⚠ L'adresse enregistrée dans la carte n'est pas
+          un firmware Newtron (${esc(url)}) : la mettre à jour avec effacerait le firmware Newtron.
+          Indiquez l'adresse du firmware Newtron de cette carte.</p>` : ""}
+        <p class="hint" style="margin-top:10px">La carte télécharge le firmware à cette adresse, redémarre
+          et revient en 1 à 2 minutes. Ne coupez pas son alimentation pendant ce temps.</p>
+        <div class="actions"><button id="mt-upgrade">Mettre à jour le firmware</button></div>
+      </div>
+      <div class="card"><h3>Emplacement</h3>
+        <p class="hint">La carte n'a pas de GPS : sa ville et son pays donnent sa position, utilisée par les
+          minuteries au lever / coucher du soleil et aux heures de prière.</p>
+        ${city === null && country === null ? `<p class="hint">⚠ Cette carte ne répond pas à GeoCity :
+          son firmware est trop ancien, mettez-le à jour d'abord.</p>` : ""}
+        <div class="form-grid">
+          <label>Ville<input id="mt-city" value="${esc((city && city.GeoCity) || "")}" placeholder="Casablanca"></label>
+          <label>Pays<input id="mt-country" value="${esc((country && country.GeoCountry) || "")}" placeholder="Maroc"></label>
+        </div>
+        <div class="actions"><button id="mt-geo">Enregistrer l'emplacement</button></div>
+      </div>
+      ${rev === undefined || rev === null ? "" : `<div class="card"><h3>Révision matérielle</h3>
+        <p class="hint">Les SMART 8R et 16R existent en 2 versions (v1 : ancien stock, v2 : production
+          actuelle) que la carte ne sait pas reconnaître seule. Sur une 16R, une mauvaise révision inverse
+          les relais 1 à 12. Changer la révision redémarre la carte.</p>
+        ${kv("Révision déclarée", rev ? `v${rev}` : "non déclarée")}
+        <div class="form-grid" style="margin-top:12px">
+          <label>Nouvelle révision<select id="mt-rev">
+            <option value="1" ${rev === 1 ? "selected" : ""}>v1 — ancien stock</option>
+            <option value="2" ${rev === 2 ? "selected" : ""}>v2 — production actuelle</option>
+          </select></label>
+        </div>
+        <div class="actions"><button id="mt-rev-save">Déclarer la révision</button></div>
+      </div>`}`;
+
+    c.querySelector("#mt-upgrade").onclick = () => {
+      const newUrl = c.querySelector("#mt-url").value.trim();
+      if (!newUrl) return this._toast("Indiquez l'adresse du firmware", true);
+      if (!NEWTRON_FIRMWARE.test(newUrl)) {
+        return this._toast("Seul un firmware Newtron (https://newtron.tech/firmware/…) peut être installé d'ici", true);
+      }
+      this._confirm(`Mettre à jour le firmware de ${dev.serial_number} ?\n${newUrl}\n\nLa carte redémarre.`, async () => {
+        if (newUrl !== url) await this.cmd("OtaUrlDiscover", newUrl);
+        await this.cmd("UpgradeDiscover", "1", false);
+        this._toast("Mise à jour lancée : la carte revient dans 1 à 2 minutes");
+      });
+    };
+    c.querySelector("#mt-geo").onclick = async () => {
+      const v = (id) => c.querySelector(id).value.trim();
+      if (!v("#mt-city") || !v("#mt-country")) return this._toast("Indiquez la ville et le pays", true);
+      try {
+        await this.cmd("GeoCity", v("#mt-city"));
+        await this.cmd("GeoCountry", v("#mt-country"));
+        this._toast("Emplacement enregistré : la carte calcule sa position");
+      } catch (e) {
+        this._toast(e.message || e, true);
+      }
+    };
+    if (c.querySelector("#mt-rev-save")) c.querySelector("#mt-rev-save").onclick = () => {
+      const n = c.querySelector("#mt-rev").value;
+      if (Number(n) === rev) return this._toast("Cette révision est déjà déclarée");
+      this._confirm(`Déclarer ${dev.serial_number} en v${n} ? La carte redémarre.`, async () => {
+        await this.cmd(`${old16r ? "Smart16RRev" : "SmartHWRev"} ${n}`, "", false);
+        this._toast(`Révision v${n} envoyée : la carte redémarre`);
+      });
+    };
+  }
+
+  // -- CONFIGURATION (inventory) ---------------------------------------
+  // Cards planned for this installation. Adding a card: pick its model, the
+  // form then lists what that model has (R1..Rn, AO1..AOn, shutters) with a
+  // name and a Home Assistant area for each. A listed card is added on its
+  // own when it comes online; names and shutters are written to the card.
+  async _tabConfig(c) {
+    if (!this._models) this._models = await this._ws({ type: "newtron/models" });
+    const models = this._models;
+    const inv = await this._ws({ type: "newtron/inventory" });
+    const areas = Object.values(this._hass.areas || {})
+      .sort((a, b) => a.name.localeCompare(b.name));
+    const STATUS = {
+      configured: ["ok", "Ajoutée à HA"],
+      online: ["warn", "En ligne — ajout en cours"],
+      waiting: ["", "En attente de la carte"],
+    };
+    const badge = (s) => `<span class="badge ${STATUS[s][0]}">${STATUS[s][1]}</span>`;
+    const modelLabel = (id, fallback) => (models[id] || {}).label || fallback || "—";
+    // The card takes its address on its own (DHCP) and announces it on the broker.
+    const ipCell = (card) => esc(card.live.ip || "—");
+    const relayCount = (card) => {
+      const outs = Object.values(card.outputs || {});
+      const sh = Object.keys(card.shutters || {}).length;
+      const shown = (group) => Object.values(card[group] || {}).filter((x) => x.used).length;
+      const ent = shown("inputs"), cap = shown("sensors"), vars = shown("variables");
+      if (!outs.length && !sh) return "—";
+      return [`${outs.filter((o) => o.used).length} sorties`, ent && `${ent} entrée${ent > 1 ? "s" : ""}`,
+        sh && `${sh} volet${sh > 1 ? "s" : ""}`,
+        cap && `${cap} capteur${cap > 1 ? "s" : ""}`, vars && `${vars} variable${vars > 1 ? "s" : ""}`]
+        .filter(Boolean).join(" · ");
+    };
+    const areaSelect = (cls, cur) =>
+      `<select class="${cls}"><option value="">— automatique —</option>
+        ${areas.map((a) => `<option value="${esc(a.area_id)}" ${a.area_id === cur ? "selected" : ""}>${esc(a.name)}</option>`).join("")}
+      </select>`;
+    const draft = this._cfgDraft;
+    const lay = draft && draft.layout;
+    const model = draft && models[draft.model_id];
+
+    // Relays driving a shutter, recomputed from the shutters being edited.
+    if (lay) {
+      const taken = {};
+      lay.shutters.forEach((s, i) => {
+        if (s.relay1) { taken[s.relay1] = i + 1; taken[Number(s.relay1) + 1] = i + 1; }
+      });
+      lay.outputs.forEach((o) => { o.shutter = taken[o.index] || null; });
+    }
+
+    const outputsTable = () => {
+      const prefix = lay.kind === "dimmer" ? "AO" : "R";
+      return `
+        <table>
+          <tr>${th("Utilisé", "Décoché : la sortie est masquée dans Home Assistant")}
+            ${th("Sortie")}
+            ${th("Nom", lay.kind === "dimmer" ? "Écrit dans la carte (24 caractères max)"
+              : "Écrit dans la carte (32 caractères max)")}
+            ${th("Pièce", "Pièce Home Assistant. « Automatique » : la pièce citée dans le nom")}</tr>
+          ${lay.outputs.map((o, i) => o.shutter ? `
+            <tr class="muted"><td></td><td class="nowrap"><b>${prefix}${o.index}</b></td>
+              <td colspan="2"><span class="badge">→ volet V${o.shutter}</span></td></tr>` : `
+            <tr data-row="o${i}">
+              <td><input type="checkbox" class="r-used" ${o.used ? "checked" : ""}></td>
+              <td class="nowrap"><b>${prefix}${o.index}</b></td>
+              <td><input class="r-name o-name" maxlength="${lay.kind === "dimmer" ? 24 : 32}" value="${esc(o.name || "")}"
+                placeholder="${esc(o.card_name || `${prefix === "R" ? "Relais" : "Sortie AO"} ${o.index}`)}"></td>
+              <td>${areaSelect("r-area", o.area_id)}</td></tr>`).join("")}
+        </table>`;
+    };
+    const relayOptions = (cur) => {
+      const opts = [];
+      for (let r = 1; r < lay.outputs.length; r += 1) {
+        opts.push(`<option value="${r}" ${Number(cur) === r ? "selected" : ""}>R${r} ↑ / R${r + 1} ↓</option>`);
+      }
+      return opts.join("");
+    };
+    const shuttersTable = () => `
+      <p class="hint">${lay.shutters.length} / ${lay.max_shutters} volets max — chaque volet utilise
+        2 relais qui se suivent : montée puis descente.</p>
+      ${lay.shutters.length ? `<table>
+        <tr>${th("Utilisé")}${th("Volet")}${th("Nom")}${th("Relais", "Relais de montée, le suivant sert à la descente")}
+          ${th("Ouverture (s)", "Durée d'une ouverture complète")}${th("Fermeture (s)", "Durée d'une fermeture complète")}
+          ${th("Pièce")}<th></th></tr>
+        ${lay.shutters.map((s, i) => `<tr data-row="s${i}">
+          <td><input type="checkbox" class="r-used" ${s.used ? "checked" : ""}></td>
+          <td class="nowrap"><b>V${i + 1}</b></td>
+          <td><input class="r-name o-name" maxlength="32" value="${esc(s.name || "")}"
+            placeholder="${esc(s.card_name || `Volet ${i + 1}`)}"></td>
+          <td><select class="s-relay"><option value="">—</option>${relayOptions(s.relay1)}</select></td>
+          <td><input class="s-open" type="number" min="1" step="0.5" value="${s.open_duration ?? 30}" style="width:72px"></td>
+          <td><input class="s-close" type="number" min="1" step="0.5" value="${s.close_duration ?? 30}" style="width:72px"></td>
+          <td>${areaSelect("r-area", s.area_id)}</td>
+          <td><button class="mini danger s-del" title="Supprimer ce volet">✕</button></td></tr>`).join("")}
+      </table>` : `<p class="hint">Aucun volet.</p>`}
+      ${lay.shutters.length < lay.max_shutters
+        ? `<div class="actions"><button id="cfg-add-sh" class="secondary mini">+ Ajouter un volet</button></div>` : ""}`;
+
+    const typeSelect = (cur) => `<select class="t-type">${SENSOR_TYPES.map(([v, l]) =>
+      `<option value="${v}" ${(cur || "") === v ? "selected" : ""}>${l}</option>`).join("")}</select>`;
+    const inputsTable = () => `
+      <p class="hint">Entrées de la carte (boutons, interrupteurs, contacts). Cochez celles à afficher
+        dans Home Assistant, puis choisissez ce qui est branché : l'entrée s'affiche comme tel.</p>
+      <table>
+        <tr>${th("Afficher", "Coché : l'entrée apparaît dans Home Assistant")}${th("Entrée")}
+          ${th("Nom", "Nom dans Home Assistant")}${th("Type", "Ce qui est branché sur l'entrée")}${th("Pièce")}</tr>
+        ${lay.inputs.map((r, i) => `<tr data-row="i${i}">
+          <td><input type="checkbox" class="r-used" ${r.used ? "checked" : ""}></td>
+          <td class="nowrap"><b>E${r.index}</b></td>
+          <td><input class="r-name o-name" maxlength="32" value="${esc(r.name || "")}" placeholder="Entrée ${r.index}"></td>
+          <td>${typeSelect(r.device_class)}</td>
+          <td>${areaSelect("r-area", r.area_id)}</td></tr>`).join("")}
+      </table>`;
+    const gpioOf = (g) => g.code ?? g.card_code ?? 0;
+    const gpioSelect = (g) => {
+      const cur = gpioOf(g);
+      const known = GPIO_PROBES.some(([v]) => v === cur);
+      return `<select class="g-probe">${known ? "" : `<option value="${cur}" selected>Autre réglage de la carte (laissé tel quel)</option>`}
+        ${GPIO_PROBES.map(([v, l]) => `<option value="${v}" ${v === cur ? "selected" : ""}>${l}</option>`).join("")}</select>`;
+    };
+    const sensorsTable = () => `
+      <p class="hint">Capteurs branchés sur les <b>GPIO</b> de la carte. Choisissez la sonde branchée sur
+        chaque GPIO : à l'enregistrement, la carte redémarre (15 s environ) pour la prendre en compte,
+        puis ses mesures apparaissent dessous.</p>
+      ${lay.gpios.length ? `<table>
+        <tr>${th("GPIO", "Borne de la carte")}${th("Capteur branché")}</tr>
+        ${lay.gpios.map((g, i) => `<tr data-gpio="${i}">
+          <td class="nowrap"><b>GPIO ${g.pin}</b></td><td>${gpioSelect(g)}</td></tr>`).join("")}
+      </table>` : `<p class="hint">${lay.source === "card"
+        ? "La carte n'a pas répondu : rouvrez la carte dans un instant."
+        : "La liste des GPIO s'affiche quand la carte est en ligne."}</p>`}
+      <h4 class="sub">Mesures</h4>
+      ${lay.sensors.length ? `<table>
+        <tr>${th("Afficher", "Coché : la mesure apparaît dans Home Assistant")}${th("Sonde")}
+          ${th("Nom", "Nom dans Home Assistant")}${th("Pièce")}</tr>
+        ${lay.sensors.map((r, i) => `<tr data-row="t${i}">
+          <td><input type="checkbox" class="r-used" ${r.used ? "checked" : ""}></td>
+          <td class="nowrap"><b>${esc(r.label)}</b> <span class="hint-inline">${esc(r.measure || "")}</span></td>
+          <td><input class="r-name o-name" maxlength="32" value="${esc(r.name || "")}" placeholder="${esc(r.card_name || r.label)}"></td>
+          <td>${areaSelect("r-area", r.area_id)}</td></tr>`).join("")}
+      </table>` : `<p class="hint">Aucune mesure reçue de la carte pour l'instant.</p>`}`;
+    const variablesTable = () => `
+      <p class="hint">Variables de la carte, utilisées par ses scénarios. <b>Var</b> : volatile, remise à 0
+        au redémarrage. <b>Mem</b> : persistante. Cochez celles à afficher dans Home Assistant.</p>
+      <table>
+        <tr>${th("Afficher", "Coché : la variable apparaît dans Home Assistant")}${th("Variable")}
+          ${th("Nom", "Nom dans Home Assistant")}${th("Pièce")}</tr>
+        ${lay.variables.map((r, i) => `<tr data-row="v${i}">
+          <td><input type="checkbox" class="r-used" ${r.used ? "checked" : ""}></td>
+          <td class="nowrap"><b>${r.persistent ? "Mem" : "Var"} ${r.index}</b></td>
+          <td><input class="r-name o-name" maxlength="32" value="${esc(r.name || "")}"
+            placeholder="${r.persistent ? "Mem" : "Var"} ${r.index}"></td>
+          <td>${areaSelect("r-area", r.area_id)}</td></tr>`).join("")}
+      </table>`;
+    // One tab per kind of item: relays, shutters, sensors, variables
+    const sections = !lay ? [] : [
+      ["sorties", lay.kind === "dimmer" ? "Sorties 0-10 V" : "Relais",
+        lay.outputs.filter((o) => !o.shutter).length, outputsTable],
+      ...(lay.inputs.length ? [["entrees", "Entrées", lay.inputs.length, inputsTable]] : []),
+      ...(lay.kind === "relay" && lay.max_shutters ? [["volets", "Volets roulants", lay.shutters.length, shuttersTable]] : []),
+      ...(lay.kind === "relay"
+        ? [["capteurs", "Capteurs", lay.gpios.filter((g) => gpioOf(g)).length, sensorsTable]] : []),
+      ...(lay.variables.length ? [["variables", "Variables", lay.variables.length, variablesTable]] : []),
+    ];
+    const section = sections.find((x) => x[0] === draft._section) || sections[0];
+
+    const formFor = () => {
+      if (!lay) return "";
+      const head = lay.source === "card"
+        ? `Configuration lue dans la carte${lay.online ? "" : " (hors ligne : dernière configuration connue)"}.
+           En enregistrant, les noms et volets modifiés sont <b>écrits dans la carte</b>.`
+        : draft.status === "configured"
+          ? `La carte est <b>hors ligne</b> : cette configuration lui sera <b>envoyée dès son retour</b>
+             sur le broker.`
+          : `La carte n'est pas encore dans Home Assistant : cette configuration lui sera
+             <b>envoyée dès son arrivée</b> sur le broker.`;
+      const unconfirmed = model && model.confirmed === false
+        ? `<p class="hint">⚠ Nombre de sorties du ${esc(model.label)} non publié sur la fiche technique :
+           vérifiez-le. Une fois la carte en ligne, sa vraie configuration remplace ces lignes.</p>` : "";
+      if (lay.kind === "ir" || lay.kind === "dali") {
+        return `<p class="hint">${lay.kind === "ir"
+          ? "Contrôleur infrarouge : un seul appareil dans Home Assistant. Les télécommandes s'apprennent dans l'onglet <b>IR remotes</b> une fois la carte ajoutée."
+          : "Passerelle DALI : un seul appareil dans Home Assistant, placé dans la pièce choisie ci-dessus."}</p>`;
+      }
+      return `<p class="hint" style="margin-top:14px">${head}</p>${unconfirmed}
+        <div class="soustabs" role="tablist">${sections.map(([id, label, n]) => `<button type="button"
+          role="tab" aria-selected="${id === section[0]}" data-section="${id}"
+          class="${id === section[0] ? "active" : ""}">${esc(label)}<span class="compte">${n}</span></button>`).join("")}</div>
+        <div class="tableau">${section[3]()}</div>`;
+    };
+
+    c.innerHTML = `
+      <div class="card"><h3>Cartes de l'installation</h3>
+        <p class="hint">Préparez ici les cartes avant d'aller chez le client. Dès qu'une carte de
+        cette liste se connecte au broker, elle est ajoutée à Home Assistant toute seule : les noms
+        et les volets sont écrits dans la carte et chaque sortie va dans sa pièce.</p>
+        ${inv.cards.length ? `<table>
+          <tr><th>N° de série</th><th>Nom de la carte</th><th>Modèle</th><th>IP</th>
+            <th>Configuration</th><th>Statut</th><th></th></tr>
+          ${inv.cards.map((card) => `<tr>
+            <td class="nowrap"><b>${esc(card.serial)}</b></td>
+            <td>${esc(card.name || "—")}</td>
+            <td>${esc(modelLabel(card.model_id || card.live.model_id, card.live.model || card.model))}</td>
+            <td class="nowrap">${ipCell(card)}</td>
+            <td>${relayCount(card)}</td>
+            <td>${badge(card.status)}${card.pushed === false && card.status === "configured"
+              ? ` <span class="badge warn" title="La carte n'a pas encore reçu la configuration">à envoyer</span>` : ""}</td>
+            <td class="nowrap">
+              <button class="mini secondary" data-edit="${esc(card.serial)}">Modifier</button>
+              <button class="mini danger" data-del="${esc(card.serial)}">Retirer</button>
+            </td></tr>`).join("")}
+        </table>` : `<p class="hint">Aucune carte pour l'instant.</p>`}
+        <div class="actions"><button id="cfg-new">+ Ajouter une carte</button></div>
+      </div>
+
+      ${draft ? `<div class="card"><h3>${draft._existing ? `Carte ${esc(draft.serial)}` : "Nouvelle carte"}</h3>
+        <div class="form-grid">
+          <label>La carte *
+            <select id="cfg-model" ${draft._locked_model ? "disabled" : ""}>
+              <option value="">— choisir le modèle —</option>
+              ${Object.entries(models).map(([id, m]) =>
+                `<option value="${id}" ${id === draft.model_id ? "selected" : ""}>${esc(m.label)}</option>`).join("")}
+            </select></label>
+          ${model ? `
+          <label>N° de série *<input id="cfg-serial" placeholder="SMART16R-1504"
+            value="${esc(draft.serial || "")}" ${draft._existing ? "disabled" : ""}></label>
+          <label>Nom de la carte<input id="cfg-name" placeholder="Tableau RDC" value="${esc(draft.name || "")}"></label>
+          ${model.kind === "ir" || model.kind === "dali" ? `<label>Pièce
+            <select id="cfg-area"><option value="">— aucune —</option>
+              ${areas.map((a) => `<option value="${esc(a.area_id)}" ${a.area_id === draft.area_id ? "selected" : ""}>${esc(a.name)}</option>`).join("")}
+            </select></label>` : ""}
+          <label>Notes<input id="cfg-notes" value="${esc(draft.notes || "")}"></label>
+          <label>Ville<input id="cfg-city" value="${esc(draft.city || "")}"
+            placeholder="${esc((lay && lay.card_city) || "Casablanca")}"></label>
+          <label>Pays<input id="cfg-country" value="${esc(draft.country || "")}"
+            placeholder="${esc((lay && lay.card_country) || "Maroc")}"></label>
+          ${/^(8R|16R)/.test(draft.model_id || "") ? `<label>Révision matérielle
+            <select id="cfg-rev"><option value="">${lay && lay.hardware_revision
+              ? `— garder v${lay.hardware_revision} —` : "— ne pas changer —"}</option>
+              <option value="1" ${draft.hw_rev === 1 ? "selected" : ""}>v1 — ancien stock</option>
+              <option value="2" ${draft.hw_rev === 2 ? "selected" : ""}>v2 — production actuelle</option>
+            </select></label>` : ""}` : ""}
+        </div>
+        ${model ? `<p class="hint-inline" style="margin-top:8px">${esc(model.label)} :
+          ${model.outputs ? `${model.outputs} ${model.kind === "dimmer" ? "sorties 0-10 V" : "relais"}` : "pas de sortie"}${
+          model.inputs ? ` · ${model.inputs} entrées` : ""}${model.max_shutters ? ` · ${model.max_shutters} volets max` : ""} · ${esc(model.network)}</p>` : ""}
+        ${formFor()}
+        <div class="actions">
+          ${model ? `<button id="cfg-save">Enregistrer${lay && lay.source === "card" && lay.online ? " et envoyer à la carte" : ""}</button>` : ""}
+          <button id="cfg-cancel" class="secondary">Annuler</button>
+        </div>
+      </div>` : ""}
+
+      ${inv.unlisted.length ? `<div class="card"><h3>Cartes vues sur le broker, hors liste</h3>
+        <p class="hint">Cartes connectées à ce broker ou déjà dans Home Assistant, mais absentes de la
+        liste ci-dessus. Ajoutez-les pour configurer leurs sorties.</p>
+        <table>
+          <tr><th>N° de série</th><th>Modèle</th><th>IP</th><th>Statut</th><th></th></tr>
+          ${inv.unlisted.map((u) => `<tr>
+            <td class="nowrap"><b>${esc(u.serial)}</b></td>
+            <td>${esc(modelLabel(u.live.model_id, u.live.model))}</td>
+            <td>${esc(u.live.ip || "—")}</td>
+            <td>${u.status === "configured" ? badge("configured")
+              : `<span class="badge warn">Proposée dans « Découverts »</span>`}</td>
+            <td><button class="mini" data-adopt="${esc(u.serial)}" data-model="${esc(u.live.model_id || "")}">Ajouter à la liste</button></td>
+          </tr>`).join("")}
+        </table></div>` : ""}`;
+
+    const loadLayout = async (d) => {
+      d.layout = d.model_id
+        ? await this._ws({ type: "newtron/inventory/layout", serial: d.serial || "", model_id: d.model_id })
+        : null;
+      // The live card knows its own model better than the form.
+      if (d.layout && d.layout.source === "card" && d.layout.model_id) {
+        d.model_id = d.layout.model_id;
+        d._locked_model = true;
+      }
+    };
+    const openDraft = async (d) => {
+      await loadLayout(d);
+      this._cfgDraft = d;
+      this._renderTab();
+    };
+    c.querySelector("#cfg-new").onclick = () => openDraft({});
+    c.querySelectorAll("[data-edit]").forEach((b) => b.onclick = () => {
+      const card = inv.cards.find((x) => x.serial === b.dataset.edit);
+      openDraft({ ...card, model_id: card.model_id || card.live.model_id, _existing: true });
+    });
+    c.querySelectorAll("[data-adopt]").forEach((b) => b.onclick = () =>
+      openDraft({ serial: b.dataset.adopt, model_id: b.dataset.model || null }));
+    c.querySelectorAll("[data-del]").forEach((b) => b.onclick = () => this._confirm(
+      `Retirer ${b.dataset.del} de la liste ? (l'appareil reste dans Home Assistant)`,
+      async () => {
+        await this._ws({ type: "newtron/inventory/delete", serial: b.dataset.del });
+        this._toast("Carte retirée de la liste");
+        this._renderTab();
+      }));
+
+    if (!draft) return;
+    const q = (id) => c.querySelector(`#${id}`);
+    const val = (id) => (q(id) ? q(id).value.trim() : "");
+    const keepHeader = () => Object.assign(draft, {
+      serial: draft._existing ? draft.serial : val("cfg-serial") || draft.serial,
+      name: val("cfg-name"), notes: val("cfg-notes"),
+      area_id: val("cfg-area") || null,
+      city: val("cfg-city"), country: val("cfg-country"),
+      hw_rev: val("cfg-rev") ? Number(val("cfg-rev")) : null,
+    });
+    // Keep what was typed across the periodic refresh.
+    c.querySelectorAll(".form-grid input, .form-grid select:not(#cfg-model)").forEach((el) =>
+      el.addEventListener("input", keepHeader));
+    q("cfg-model").onchange = async (e) => {
+      keepHeader();
+      draft.model_id = e.target.value || null;
+      await loadLayout(draft);
+      this._renderTab();
+    };
+    // A serial typed for a card already online: read its real configuration.
+    if (q("cfg-serial") && !draft._existing) q("cfg-serial").onchange = async () => {
+      keepHeader();
+      await loadLayout(draft);
+      this._renderTab();
+    };
+    // Phone: the tab row scrolls sideways, keep the open tab in view
+    const ouvert = c.querySelector(".soustabs .active");
+    if (ouvert) ouvert.parentElement.scrollLeft = ouvert.offsetLeft - 16;
+    c.querySelectorAll("[data-section]").forEach((b) => b.onclick = () => {
+      keepHeader();
+      draft._section = b.dataset.section;
+      this._renderTab();
+    });
+    const ROWS = { o: "outputs", s: "shutters", i: "inputs", t: "sensors", v: "variables" };
+    const rowOf = (tr) => lay[ROWS[tr.dataset.row[0]]][Number(tr.dataset.row.slice(1))];
+    c.querySelectorAll("tr[data-gpio]").forEach((tr) => {
+      tr.querySelector(".g-probe").onchange = (e) => { lay.gpios[Number(tr.dataset.gpio)].code = Number(e.target.value); };
+    });
+    c.querySelectorAll("tr[data-row]").forEach((tr) => {
+      const row = rowOf(tr);
+      tr.querySelector(".r-used").onchange = (e) => { row.used = e.target.checked; };
+      tr.querySelector(".r-name").oninput = (e) => { row.name = e.target.value; };
+      tr.querySelector(".r-area").onchange = (e) => { row.area_id = e.target.value || null; };
+      const type = tr.querySelector(".t-type");
+      if (type) type.onchange = (e) => { row.device_class = e.target.value || null; };
+      if (tr.dataset.row[0] !== "s") return;
+      tr.querySelector(".s-relay").onchange = (e) => {
+        const r = Number(e.target.value) || null;
+        const clash = r && lay.shutters.some((s) => s !== row && s.relay1
+          && [s.relay1, s.relay1 + 1].some((x) => x === r || x === r + 1));
+        if (clash) { this._toast(`R${r}/R${r + 1} sont déjà pris par un autre volet`, true); e.target.value = row.relay1 || ""; return; }
+        row.relay1 = r;
+        this._renderTab();
+      };
+      tr.querySelector(".s-open").oninput = (e) => { row.open_duration = Number(e.target.value); };
+      tr.querySelector(".s-close").oninput = (e) => { row.close_duration = Number(e.target.value); };
+      tr.querySelector(".s-del").onclick = () => {
+        lay.shutters.splice(lay.shutters.indexOf(row), 1);
+        this._renderTab();
+      };
+    });
+    if (q("cfg-add-sh")) q("cfg-add-sh").onclick = () => {
+      keepHeader();
+      lay.shutters.push({ used: true, name: "", relay1: null, open_duration: 30, close_duration: 30, area_id: null });
+      this._renderTab();
+    };
+    q("cfg-cancel").onclick = () => { this._cfgDraft = null; this._renderTab(); };
+    if (!q("cfg-save")) return;
+    q("cfg-save").onclick = async () => {
+      keepHeader();
+      const serial = draft.serial;
+      if (!serial) return this._toast("Le n° de série est obligatoire", true);
+      if (lay && lay.shutters.some((s) => !s.relay1)) return this._toast("Choisissez les relais de chaque volet", true);
+      const slot = (r) => ({ used: r.used, name: (r.name || "").trim() || null, area_id: r.area_id || null });
+      const outputs = Object.fromEntries(((lay && lay.outputs) || [])
+        .filter((o) => !o.shutter).map((o) => [String(o.index), slot(o)]));
+      const shutters = Object.fromEntries(((lay && lay.shutters) || []).map((s, i) => [String(i + 1), {
+        ...slot(s), relay1: Number(s.relay1), open_duration: Number(s.open_duration) || 30,
+        close_duration: Number(s.close_duration) || 30,
+      }]));
+      const keyed = (group) => Object.fromEntries(((lay && lay[group]) || [])
+        .map((r) => [String(r.key), group === "inputs" ? { ...slot(r), device_class: r.device_class || null } : slot(r)]));
+      try {
+        const saved = await this._ws({
+          type: "newtron/inventory/save", serial,
+          model_id: draft.model_id, model: (models[draft.model_id] || {}).label || null,
+          name: draft.name, notes: draft.notes, area_id: draft.area_id || null,
+          city: draft.city || null, country: draft.country || null, hw_rev: draft.hw_rev || null,
+          outputs, shutters,
+          inputs: keyed("inputs"), variables: keyed("variables"), sensors: keyed("sensors"),
+          // Only GPIO set here are written; "as is on the card" stays untouched
+          gpios: Object.fromEntries(((lay && lay.gpios) || []).filter((g) => g.code != null)
+            .map((g) => [String(g.pin), g.code])),
+        });
+        this._cfgDraft = null;
+        this._toast(saved.pushed ? `Carte ${serial} : configuration envoyée à la carte`
+          : `Carte ${serial} enregistrée — envoi à la carte dès son arrivée`);
+        await this._loadDevices(true);
+        this._renderTab();
+      } catch (e) {
+        this._toast(e.message || e, true);
+      }
+    };
+  }
+
   // -- CONSOLE ---------------------------------------------------------
   _tabConsole(c) {
     c.innerHTML = `
@@ -1438,6 +1974,30 @@ const STYLES = `
   .slider-cell { display: flex; align-items: center; gap: 10px; }
   .slider-cell span { min-width: 42px; font-weight: 700; }
   .nowrap { white-space: nowrap; }
+  h4.sub { margin: 18px 0 8px; font-size: 14px; }
+  .soustabs { display: flex; gap: 4px; margin: 16px 0 14px; border-bottom: 1px solid var(--nt-border);
+    overflow-x: auto; scrollbar-width: none; }
+  .soustabs::-webkit-scrollbar { display: none; }
+  .soustabs button { background: transparent; color: var(--nt-muted); border-radius: 9px 9px 0 0;
+    padding: 9px 14px; border-bottom: 2px solid transparent; margin-bottom: -1px; display: inline-flex;
+    align-items: center; gap: 8px; white-space: nowrap; }
+  .soustabs button:hover { color: var(--nt-text); background: rgba(0,0,0,.04); filter: none; }
+  .soustabs button.active { color: var(--nt-text); border-bottom-color: var(--nt-accent); }
+  .soustabs .compte { font-size: 11px; font-weight: 700; padding: 1px 7px; border-radius: 999px;
+    background: rgba(0,0,0,.07); color: var(--nt-muted); }
+  .soustabs button.active .compte { background: var(--nt-accent); color: #04201d; }
+  input:disabled, select:disabled { opacity: .45; cursor: not-allowed; }
+  /* Phone: the table scrolls sideways instead of crushing the name column */
+  .tableau { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  .tableau table { min-width: 640px; }
+  .tableau .o-name { min-width: 150px; }
+  .tableau .hint { position: sticky; left: 0; max-width: calc(100vw - 64px); }
+  tr.muted td { color: var(--nt-muted); }
+  .badge { display: inline-block; padding: 3px 9px; border-radius: 999px; font-size: 12px;
+    font-weight: 600; background: rgba(0,0,0,.06); color: var(--nt-muted); white-space: nowrap; }
+  .badge.ok { background: rgba(0,184,169,.18); color: #0c7d72; }
+  .badge.warn { background: rgba(255,176,0,.2); color: #9a6b00; }
+  .badge.bad { background: rgba(229,72,77,.15); color: var(--nt-danger); }
   .json { background: #0c1b22; color: #b6f0e7; padding: 14px; border-radius: 10px; font-size: 12.5px;
     overflow: auto; max-height: 360px; white-space: pre-wrap; word-break: break-word; }
   .empty { text-align: center; color: var(--nt-muted); padding: 60px 20px; font-size: 15px; line-height: 1.6; }

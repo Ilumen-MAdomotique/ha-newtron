@@ -27,16 +27,21 @@ from homeassistant.helpers.dispatcher import async_dispatcher_send
 
 from .const import (
     COMMAND_TIMEOUT,
+    DEVICE_STATUS_TIMEOUTS,
     FAMILY_DIMMER,
     FAMILY_IR,
+    FAMILY_DALI,
     FAMILY_PRO,
     FAMILY_RELAY,
+    LAYOUT_REFRESH_EVERY,
     SIGNAL_UPDATE,
 )
 
 _LOGGER = logging.getLogger(__name__)
 
 _TRAILING_DIGITS = re.compile(r"\d+$")
+# DALI: the light fades to its new level; read it back after these waits (s)
+DALI_READ_BACK = (2, 4)
 
 
 def _base_command(command: str) -> str:
@@ -47,6 +52,15 @@ def _base_command(command: str) -> str:
     """
     head = command.split(" ", 1)[0]
     return _TRAILING_DIGITS.sub("", head).lower()
+
+
+def _sensor_reading(value: dict[str, Any]) -> dict[str, Any]:
+    """One probe of StatusAll / SENSOR, whatever the casing."""
+    return {
+        "id": value.get("Id") or value.get("id"),
+        "temperature": value.get("Temperature", value.get("temperature")),
+        "humidity": value.get("Humidity", value.get("humidity")),
+    }
 
 
 class NewtronHub:
@@ -85,8 +99,16 @@ class NewtronHub:
         self.shutter_configs: list[dict[str, Any]] = []
         self.vthermostats: dict[int, dict[str, Any]] = {}
         self.sensors: dict[str, dict[str, Any]] = {}  # "DS18B20-1" -> {id, temperature}
+        # SMART DALI: light N -> {name, state, status, level} (StatusAll / DaliState)
+        self.dali_lights: dict[int, dict[str, Any]] = {}
+        # SMART DALI: DaliConfig (lights with groups/scenes, groups, scenes, read)
+        self.dali_config: dict[str, Any] = {}
+        self._dali_shape: tuple | None = None
         self.temp_unit: str = "C"
         self.last_update: float = 0.0
+        self._polls: int = 0
+        # Called with the new RelayLayout when the board's names change.
+        self.on_layout_changed: Callable[[dict[str, Any]], None] | None = None
 
     # ------------------------------------------------------------------
     # lifecycle
@@ -101,8 +123,15 @@ class NewtronHub:
         )
 
         # Initial model. DeviceStatus is mandatory; the rest is best-effort
-        # because sections are board-dependent.
-        device_status = await self.async_command("DeviceStatus")
+        # because sections are board-dependent. Right after Home Assistant
+        # starts the first request is often lost (broker subscription not
+        # active yet), so it is resent after a short wait, then with longer
+        # waits for a slow card, before giving up.
+        device_status = None
+        for timeout in DEVICE_STATUS_TIMEOUTS:
+            device_status = await self.async_command("DeviceStatus", timeout=timeout)
+            if device_status:
+                break
         if device_status:
             self._apply_device_status(device_status)
 
@@ -112,12 +141,21 @@ class NewtronHub:
 
         self._detect_family()
 
+        # Probes wired on the GPIO (DS18x20, DHT...) so that their entities
+        # exist from the start, not only after the first SENSOR telemetry.
+        if self.family in (FAMILY_RELAY, FAMILY_PRO):
+            sns = await self.async_command("Status 10", timeout=4)
+            if sns and isinstance(sns.get("StatusSNS"), dict):
+                self._apply_sensor_telemetry(sns["StatusSNS"])
+
         if self.family in (FAMILY_RELAY, FAMILY_PRO):
             layout = await self.async_command("RelayLayout")
             if layout and "RelayLayout" in layout:
-                self.relay_layout = layout["RelayLayout"]
-                for shutter_cfg in self.relay_layout.get("roller_shutters", []):
-                    self.shutter_configs.append(shutter_cfg)
+                self._set_relay_layout(layout["RelayLayout"])
+
+        if self.family == FAMILY_DALI:
+            await self.async_reload_dali_config()
+            self._dali_shape = self._dali_layout_shape()
 
         if self.capabilities.get("max_vthermostats"):
             vt = await self.async_command("VThermostat")
@@ -142,10 +180,154 @@ class NewtronHub:
         self._pending.clear()
 
     async def async_refresh(self, _now: Any = None) -> None:
-        """Periodic refresh: StatusAll is the consolidated snapshot (doc §15)."""
+        """Periodic refresh: StatusAll is the consolidated snapshot (doc §15).
+
+        Every LAYOUT_REFRESH_EVERY polls the RelayLayout is read again so
+        names edited on the board reach Home Assistant.
+        """
         result = await self.async_command("StatusAll")
         if result:
             self._apply_status_all(result.get("StatusAll", {}))
+
+        self._polls += 1
+        if self.family in (FAMILY_RELAY, FAMILY_PRO) and (
+            self._polls % LAYOUT_REFRESH_EVERY == 0
+        ):
+            await self.async_reload_layout()
+
+        if self.family == FAMILY_DALI:
+            # Groups and scenes are read from the ballasts in the background:
+            # ask again until the board has them.
+            if not (self.dali_config.get("read") or {}).get("groups"):
+                await self.async_reload_dali_config()
+            shape = self._dali_layout_shape()
+            if shape != self._dali_shape:
+                _LOGGER.info("%s: DALI lights, groups or scenes changed, reloading", self.topic)
+                self._dali_shape = shape
+                self.hass.config_entries.async_schedule_reload(self.entry_id)
+
+        if result:
+            self._notify()
+
+    async def _async_back_online(self) -> None:
+        """A card back from a restart may run a new firmware or revision:
+        rebuild its entities and device info when it does."""
+        before = (self.firmware_version, self.board_name, self.hardware_revision)
+        for timeout in DEVICE_STATUS_TIMEOUTS:
+            status = await self.async_command("DeviceStatus", timeout=timeout)
+            if status:
+                break
+        else:
+            return
+        self._apply_device_status(status)
+        if (self.firmware_version, self.board_name, self.hardware_revision) != before:
+            _LOGGER.info(
+                "%s now runs %s (%s), reloading", self.topic, self.firmware_version, self.board_name
+            )
+            self.hass.config_entries.async_schedule_reload(self.entry_id)
+
+    # ------------------------------------------------------------------
+    # SMART DALI
+    # ------------------------------------------------------------------
+    async def async_reload_dali_config(self) -> None:
+        """Read DaliConfig: names, group members, scenes (doc §21.3)."""
+        res = await self.async_command("DaliConfig", timeout=4)
+        if res and isinstance(res.get("DaliConfig"), dict):
+            self.dali_config = res["DaliConfig"]
+
+    def _dali_layout_shape(self) -> tuple:
+        """What decides which DALI entities exist: lights, groups, scenes."""
+        return (
+            tuple(sorted(self.dali_lights)),
+            tuple(sorted(self.dali_groups)),
+            tuple(sorted(self.dali_scenes)),
+        )
+
+    @property
+    def dali_groups(self) -> dict[int, dict[str, Any]]:
+        """Group G -> {name, members}: groups named or holding a light."""
+        return {
+            int(k[5:]): v for k, v in (self.dali_config.get("groups") or {}).items()
+            if k.startswith("group") and k[5:].isdigit()
+        }
+
+    @property
+    def dali_scenes(self) -> dict[int, dict[str, Any]]:
+        """Scene S -> {name, enabled, lights}: scenes named, enabled or used."""
+        return {
+            int(k[5:]): v for k, v in (self.dali_config.get("scenes") or {}).items()
+            if k.startswith("scene") and k[5:].isdigit()
+        }
+
+    @callback
+    def async_dali_follow(self, lights: list[int], level: int | None = None) -> None:
+        """After an order: show the level asked for at once, then read the real
+        one when the fade is over (the light moves gradually to its level)."""
+        if level is not None:
+            for n in lights:
+                if n in self.dali_lights:
+                    self.dali_lights[n] = {**self.dali_lights[n], "level": level}
+            self._notify()
+
+        async def _read_back() -> None:
+            for delay in DALI_READ_BACK:
+                await asyncio.sleep(delay)
+                for n in lights:
+                    await self.async_dali_read_light(n)
+
+        self.hass.async_create_background_task(_read_back(), f"newtron dali {self.topic}")
+
+    async def async_dali_read_light(self, idx: int) -> None:
+        """DaliState<N>: the real level of light N, read on the bus (~80 ms)."""
+        res = await self.async_command(f"DaliState{idx}", timeout=3)
+        state = (res or {}).get("DaliState")
+        if isinstance(state, dict) and state.get("light") == idx:
+            merged = dict(self.dali_lights.get(idx, {}))
+            merged.update({k: v for k, v in state.items() if k != "light"})
+            self.dali_lights[idx] = merged
+            self._notify()
+
+    async def async_read_gpios(self) -> dict[int, int] | None:
+        """User-configurable GPIO and what is set on each: {25: 1312, ...}."""
+        res = await self.async_command("Gpio", timeout=4)
+        if res is None:
+            return None
+        gpios: dict[int, int] = {}
+        for key, value in res.items():
+            if key.upper().startswith("GPIO") and key[4:].isdigit() and isinstance(value, dict) and value:
+                gpios[int(key[4:])] = int(next(iter(value)))
+        return gpios
+
+    async def async_reload_layout(self) -> None:
+        """Read RelayLayout again (after a poll or after writing names)."""
+        layout = await self.async_command("RelayLayout")
+        if layout and "RelayLayout" in layout:
+            self._apply_relay_layout(layout["RelayLayout"])
+
+    def _set_relay_layout(self, layout: dict[str, Any]) -> None:
+        self.relay_layout = layout
+        self.shutter_configs = list(layout.get("roller_shutters", []))
+
+    @staticmethod
+    def _layout_shape(layout: dict[str, Any]) -> tuple:
+        """What decides which entities exist: free outputs and shutter count."""
+        return (
+            tuple(sorted(out["output"] for out in layout.get("free_outputs", []))),
+            len(layout.get("roller_shutters", [])),
+        )
+
+    def _apply_relay_layout(self, layout: dict[str, Any]) -> None:
+        """Take a fresh RelayLayout; reload the entry if entities must change."""
+        if layout == self.relay_layout:
+            return
+        reshaped = self._layout_shape(layout) != self._layout_shape(self.relay_layout)
+        self._set_relay_layout(layout)
+        if self.on_layout_changed is not None:
+            self.on_layout_changed(layout)
+        if reshaped:
+            _LOGGER.info("%s: outputs or shutters changed on the board, reloading", self.topic)
+            self.hass.config_entries.async_schedule_reload(self.entry_id)
+        else:
             self._notify()
 
     # ------------------------------------------------------------------
@@ -206,6 +388,14 @@ class NewtronHub:
         # flight from a given caller, resolve every pending future with this
         # reply rather than letting it time out — callers already handle a
         # missing config key by treating the result as empty.
+        # A command the firmware does not know: {"Command":"Unknown","Input":"AONAME"}
+        if data.get("Command") == "Unknown" and isinstance(data.get("Input"), str):
+            unknown = _base_command(data["Input"])
+            for fut in self._pending.get(unknown, []):
+                if not fut.done():
+                    fut.set_result(data)
+            return
+
         if set(keys_lower) == {"error"}:
             for base, futures in list(self._pending.items()):
                 for fut in futures:
@@ -252,7 +442,12 @@ class NewtronHub:
     def _handle_tele(self, msg: mqtt.ReceiveMessage) -> None:
         suffix = msg.topic[len(self._tele):]
         if suffix == "LWT":
+            was_available = self.available
             self.available = msg.payload == "Online"
+            if self.available and not was_available:
+                self.hass.async_create_background_task(
+                    self._async_back_online(), f"newtron back online {self.topic}"
+                )
             self._notify()
             return
         try:
@@ -280,6 +475,8 @@ class NewtronHub:
         board = (self.device_info_raw.get("device_info", {}) or {}).get("board_name", "")
         if re.search(r"\bIR\b", board.upper()):
             self.family = FAMILY_IR
+        elif self.capabilities.get("dali"):
+            self.family = FAMILY_DALI
         elif "ao" in self.status_all:
             self.family = FAMILY_DIMMER
         elif "max_roller_shutters" in self.capabilities or "max_alarms" in self.capabilities:
@@ -311,6 +508,9 @@ class NewtronHub:
         for key, value in (body.get("persistant_variables") or {}).items():
             if key.startswith("mem"):
                 self.mems[int(key[3:])] = str(value)
+        for key, value in (body.get("lights") or {}).items():
+            if key.startswith("light") and key[5:].isdigit() and isinstance(value, dict):
+                self.dali_lights[int(key[5:])] = value
         for key, value in (body.get("roller_shutters") or {}).items():
             if key.startswith("roller_shutter"):
                 self.shutters[int(key[14:])] = value
@@ -326,21 +526,18 @@ class NewtronHub:
             if key == "temp_unit":
                 self.temp_unit = value
             elif isinstance(value, dict):
-                self.sensors[key] = {
-                    "id": value.get("id") or value.get("Id"),
-                    "temperature": value.get("temperature", value.get("Temperature")),
-                }
+                self.sensors[key] = _sensor_reading(value)
 
     def _apply_sensor_telemetry(self, data: dict[str, Any]) -> None:
-        """tele/<topic>/SENSOR uses Tasmota casing: {"DS18B20-1":{"Id","Temperature"}}."""
+        """tele/<topic>/SENSOR uses Tasmota casing: {"DS18B20-1":{"Id","Temperature"}},
+        {"AM2301":{"Temperature","Humidity"}}."""
         for key, value in data.items():
-            if isinstance(value, dict) and (
-                "Temperature" in value or "temperature" in value
+            if key in ("ESP32", "ESP8266", "Global"):
+                continue  # chip temperature / averages, not a wired probe
+            if isinstance(value, dict) and any(
+                k in value for k in ("Temperature", "temperature", "Humidity", "humidity")
             ):
-                self.sensors[key] = {
-                    "id": value.get("Id") or value.get("id"),
-                    "temperature": value.get("Temperature", value.get("temperature")),
-                }
+                self.sensors[key] = _sensor_reading(value)
         if "TempUnit" in data:
             self.temp_unit = data["TempUnit"]
 
@@ -398,6 +595,12 @@ class NewtronHub:
         )
 
     @property
+    def hardware_revision(self) -> int | None:
+        """8R / 16R: 0 = not declared, 1 = v1, 2 = v2; None on other boards."""
+        rev = (self.device_info_raw.get("device_info", {}) or {}).get("hardware_revision")
+        return int(rev) if rev is not None else None
+
+    @property
     def board_name(self) -> str:
         return (self.device_info_raw.get("device_info", {}) or {}).get("board_name", "")
 
@@ -433,6 +636,12 @@ class NewtronHub:
                     return name
         return None
 
+    def shutter_name(self, idx: int) -> str | None:
+        """Name of the 1-based shutter ``idx`` as set on the board."""
+        if 0 < idx <= len(self.shutter_configs):
+            return (self.shutter_configs[idx - 1].get("name") or "").strip() or None
+        return None
+
     @callback
     def _notify(self) -> None:
         async_dispatcher_send(self.hass, SIGNAL_UPDATE.format(self.entry_id))
@@ -453,5 +662,7 @@ class NewtronHub:
             "relay_layout": self.relay_layout,
             "vthermostats": {str(k): v for k, v in self.vthermostats.items()},
             "ao_modes": {str(k): v for k, v in self.ao_modes.items()},
+            "hardware_revision": self.hardware_revision,
+            "dali_config": self.dali_config,
             "last_update": self.last_update,
         }

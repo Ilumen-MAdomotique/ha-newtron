@@ -17,7 +17,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import DOMAIN, FAMILY_DIMMER, FAMILY_PRO
-from .entity import NewtronEntity
+from .entity import NewtronBoardNamedEntity, NewtronEntity
 from .hub import NewtronHub
 
 
@@ -39,14 +39,17 @@ async def async_setup_entry(
     async_add_entities(entities)
 
 
-class NewtronRelaySwitch(NewtronEntity, SwitchEntity):
+class NewtronRelaySwitch(NewtronBoardNamedEntity, SwitchEntity):
     """A free relay output controlled via Power<N> (doc §3)."""
 
     def __init__(self, hub: NewtronHub, idx: int) -> None:
         super().__init__(hub)
         self._idx = idx
         self._attr_unique_id = f"{hub.serial_number}_relay_{idx}"
-        self._attr_name = hub.relay_name(idx) or f"Relay {idx}"
+        self._attr_name = self._board_name()
+
+    def _board_name(self) -> str:
+        return self._hub.relay_name(self._idx) or f"Relay {self._idx}"
 
     @property
     def is_on(self) -> bool | None:

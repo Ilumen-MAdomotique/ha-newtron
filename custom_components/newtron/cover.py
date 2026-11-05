@@ -20,7 +20,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import DOMAIN, FAMILY_RELAY
-from .entity import NewtronEntity
+from .entity import NewtronBoardNamedEntity
 from .hub import NewtronHub
 
 
@@ -31,16 +31,15 @@ async def async_setup_entry(
     if hub.family != FAMILY_RELAY:
         return
     entities = [
-        NewtronShutter(hub, idx + 1, cfg)
-        for idx, cfg in enumerate(hub.shutter_configs)
+        NewtronShutter(hub, idx + 1) for idx in range(len(hub.shutter_configs))
     ]
     # Fallback when RelayLayout was unavailable but StatusAll shows shutters
     if not entities:
-        entities = [NewtronShutter(hub, idx, {}) for idx in sorted(hub.shutters)]
+        entities = [NewtronShutter(hub, idx) for idx in sorted(hub.shutters)]
     async_add_entities(entities)
 
 
-class NewtronShutter(NewtronEntity, CoverEntity):
+class NewtronShutter(NewtronBoardNamedEntity, CoverEntity):
     """One configured roller shutter."""
 
     _attr_device_class = CoverDeviceClass.SHUTTER
@@ -51,12 +50,14 @@ class NewtronShutter(NewtronEntity, CoverEntity):
         | CoverEntityFeature.SET_POSITION
     )
 
-    def __init__(self, hub: NewtronHub, idx: int, config: dict[str, Any]) -> None:
+    def __init__(self, hub: NewtronHub, idx: int) -> None:
         super().__init__(hub)
         self._idx = idx
         self._attr_unique_id = f"{hub.serial_number}_shutter_{idx}"
-        name = (config.get("name") or "").strip()
-        self._attr_name = name or f"Shutter {idx}"
+        self._attr_name = self._board_name()
+
+    def _board_name(self) -> str:
+        return self._hub.shutter_name(self._idx) or f"Shutter {self._idx}"
 
     @property
     def _state(self) -> dict[str, Any]:
