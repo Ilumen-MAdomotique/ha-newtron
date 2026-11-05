@@ -39,6 +39,74 @@ A local-push Home Assistant integration for Newtron Smart boards (relay, dimmer,
 - A board back from a restart or update is read again and its entities rebuilt
 - English and French
 
+## Screenshots
+
+Demo boards, shown in French with the Newtron theme.
+
+### Home Assistant
+
+**A new board is offered under "Discovered"**
+
+![A new board is offered under "Discovered"](https://raw.githubusercontent.com/Ilumen-MAdomotique/ha-newtron/master/docs/screenshots/discovered.jpg)
+
+**All boards in one place**
+
+![All boards in one place](https://raw.githubusercontent.com/Ilumen-MAdomotique/ha-newtron/master/docs/screenshots/boards.jpg)
+
+**A board and its controls**
+
+![A board and its controls](https://raw.githubusercontent.com/Ilumen-MAdomotique/ha-newtron/master/docs/screenshots/device.jpg)
+
+**Everything sorted by room**
+
+![Everything sorted by room](https://raw.githubusercontent.com/Ilumen-MAdomotique/ha-newtron/master/docs/screenshots/rooms.jpg)
+
+### Newtron panel
+
+**Live inputs and outputs, identity, network**
+
+![Live inputs and outputs, identity, network](https://raw.githubusercontent.com/Ilumen-MAdomotique/ha-newtron/master/docs/screenshots/overview.jpg)
+
+**Roller shutters**
+
+![Roller shutters](https://raw.githubusercontent.com/Ilumen-MAdomotique/ha-newtron/master/docs/screenshots/shutters.jpg)
+
+**Timers: fixed time, sunrise, sunset, prayer times**
+
+![Timers: fixed time, sunrise, sunset, prayer times](https://raw.githubusercontent.com/Ilumen-MAdomotique/ha-newtron/master/docs/screenshots/timers.jpg)
+
+**Firmware, location, hardware revision**
+
+![Firmware, location, hardware revision](https://raw.githubusercontent.com/Ilumen-MAdomotique/ha-newtron/master/docs/screenshots/maintenance.jpg)
+
+### Preparing an installation
+
+**The boards of the site**
+
+![The boards of the site](https://raw.githubusercontent.com/Ilumen-MAdomotique/ha-newtron/master/docs/screenshots/configuration.jpg)
+
+**Prepare a board before it is installed**
+
+![Prepare a board before it is installed](https://raw.githubusercontent.com/Ilumen-MAdomotique/ha-newtron/master/docs/screenshots/prepare-board.jpg)
+
+**Name and room of each output**
+
+![Name and room of each output](https://raw.githubusercontent.com/Ilumen-MAdomotique/ha-newtron/master/docs/screenshots/relays.jpg)
+
+### Other boards
+
+**SMART DIMMER**
+
+![SMART DIMMER](https://raw.githubusercontent.com/Ilumen-MAdomotique/ha-newtron/master/docs/screenshots/dimmer.jpg)
+
+**SMART DALI**
+
+![SMART DALI](https://raw.githubusercontent.com/Ilumen-MAdomotique/ha-newtron/master/docs/screenshots/dali.jpg)
+
+**SMART IR**
+
+![SMART IR](https://raw.githubusercontent.com/Ilumen-MAdomotique/ha-newtron/master/docs/screenshots/ir.jpg)
+
 ## Requirements
 
 - Home Assistant 2026.8 or newer
